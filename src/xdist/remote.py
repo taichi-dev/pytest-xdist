@@ -68,12 +68,16 @@ class WorkerInteractor:
         self.log("sending", name, kwargs)
         self.channel.send((name, kwargs))
 
+    def retire(self, layoff):
+        self.sendevent("workerretire", layoff=layoff)
+        os._exit(0)
+
     @pytest.hookimpl
     def pytest_internalerror(self, excrepr):
         formatted_error = str(excrepr)
         for line in formatted_error.split("\n"):
             self.log("IERROR>", line)
-        interactor.sendevent("internal_error", formatted_error=formatted_error)
+        self.sendevent("internal_error", formatted_error=formatted_error)
 
     @pytest.hookimpl
     def pytest_sessionstart(self, session):

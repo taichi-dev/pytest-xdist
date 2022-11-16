@@ -339,6 +339,9 @@ class WorkerController:
                 self.log(f"ignoring {eventname}({kwargs})")
             elif eventname == "workerready":
                 self.notify_inproc(eventname, node=self, **kwargs)
+            elif eventname == "workerretire":
+                self.notify_inproc(eventname, node=self, **kwargs)
+                self._down = True
             elif eventname == "internal_error":
                 self.notify_inproc(eventname, node=self, **kwargs)
             elif eventname == "workerfinished":

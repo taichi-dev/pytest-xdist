@@ -227,6 +227,25 @@ class DSession:
             self._clone_node(node)
         self._active_nodes.remove(node)
 
+    def worker_workerretire(self, node, layoff=False):
+        self.config.hook.pytest_testnodedown(node=node, error=None)
+        try:
+            crashitem = self.sched.remove_node(node)
+        except KeyError:
+            pass
+        else:
+            if crashitem:
+                self.handle_crashitem(crashitem, node)
+
+        self.shuttingdown = False
+
+        if not layoff or self._active_nodes == {node}:
+            # We don't layoff the last worker
+            self.report_line("")
+            self._clone_node(node)
+
+        self._active_nodes.remove(node)
+
     @pytest.hookimpl
     def pytest_terminal_summary(self, terminalreporter):
         if self.config.option.verbose >= 0 and self._summary_report:
