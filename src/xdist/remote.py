@@ -309,4 +309,5 @@ if __name__ == "__channelexec__":
     config.workerinput = workerinput  # type: ignore[attr-defined]
     config.workeroutput = {}  # type: ignore[attr-defined]
     interactor = WorkerInteractor(config, channel)  # type: ignore[name-defined]
+    sys.xdist_interactor = interactor  # type: ignore[attr-defined]
     config.hook.pytest_cmdline_main(config=config)
