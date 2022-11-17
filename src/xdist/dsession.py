@@ -44,6 +44,7 @@ class DSession:
         self._session = None
         self._failed_collection_errors = {}
         self._active_nodes = set()
+        self._retired_nodes = []
         self._failed_nodes_count = 0
         self._max_worker_restart = get_default_max_worker_restart(self.config)
         # summary message to print at the end of the session
@@ -122,9 +123,18 @@ class DSession:
         """Process one callback from one of the workers."""
         while 1:
             if not self._active_nodes:
-                # If everything has died stop looping
-                self.triggershutdown()
-                raise RuntimeError("Unexpectedly no active workers available")
+                if self._retired_nodes:
+                    # All nodes are down, but we still have some
+                    # tests not yet executed. Revive retired nodes
+                    # one by one and try to execute the tests again.
+                    node = self._retired_nodes.pop()
+                    self._clone_node(node)
+                    assert self._active_nodes
+                    continue
+                else:
+                    # If everything has died stop looping
+                    self.triggershutdown()
+                    raise RuntimeError("Unexpectedly no active workers available")
             try:
                 eventcall = self.queue.get(timeout=2.0)
                 break
@@ -239,10 +249,11 @@ class DSession:
 
         self.shuttingdown = False
 
-        if not layoff or self._active_nodes == {node}:
-            # We don't layoff the last worker
+        if not layoff:
             self.report_line("")
             self._clone_node(node)
+        else:
+            self._retired_nodes.append(node)
 
         self._active_nodes.remove(node)
 
