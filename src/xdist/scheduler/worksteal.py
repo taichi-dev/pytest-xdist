@@ -1,4 +1,4 @@
-from itertools import cycle
+from collections import namedtuple
 
 from _pytest.runner import CollectReport
 
@@ -7,21 +7,20 @@ from xdist.workermanage import parse_spec_config
 from xdist.report import report_collection_diff
 
 
-class LoadScheduling:
-    """Implement load scheduling across nodes.
+NodePending = namedtuple("NodePending", ["node", "pending"])
 
-    This distributes the tests collected across all nodes so each test
-    is run just once.  All nodes collect and submit the test suite and
-    when all collections are received it is verified they are
-    identical collections.  Then the collection gets divided up in
-    chunks and chunks get submitted to nodes.  Whenever a node finishes
-    an item, it calls ``.mark_test_complete()`` which will trigger the
-    scheduler to assign more tests if the number of pending tests for
-    the node falls below a low-watermark.
+# Every worker needs at least 2 tests in queue - the current and the next one.
+MIN_PENDING = 2
 
-    When created, ``numnodes`` defines how many nodes are expected to
-    submit a collection. This is used to know when all nodes have
-    finished collection or how large the chunks need to be created.
+
+class WorkStealingScheduling:
+    """Implement work-stealing scheduling.
+
+    Initially, tests are distributed evenly among all nodes.
+
+    When some node completes most of its assigned tests (when only one pending
+    test remains), an attempt is made to reassign ("steal") some tests from
+    other nodes to this node.
 
     Attributes:
 
@@ -51,6 +50,11 @@ class LoadScheduling:
     :log: A py.log.Producer instance.
 
     :config: Config object, used for handling hooks.
+
+    :steal_requested_from_node: The node to which the current "steal" request
+       was sent. ``None`` if there is no request in progress. Only one request
+       can be in progress at any time, the scheduler doesn't send multiple
+       simultaneous requests.
     """
 
     def __init__(self, config, log=None):
@@ -60,11 +64,11 @@ class LoadScheduling:
         self.pending = []
         self.collection = None
         if log is None:
-            self.log = Producer("loadsched")
+            self.log = Producer("workstealsched")
         else:
-            self.log = log.loadsched
+            self.log = log.workstealsched
         self.config = config
-        self.maxschedchunk = self.config.getoption("maxschedchunk")
+        self.steal_requested_from_node = None
 
     @property
     def nodes(self):
@@ -88,8 +92,10 @@ class LoadScheduling:
             return False
         if self.pending:
             return False
+        if self.steal_requested_from_node is not None:
+            return False
         for pending in self.node2pending.values():
-            if len(pending) >= 2:
+            if len(pending) >= MIN_PENDING:
                 return False
         return True
 
@@ -141,58 +147,90 @@ class LoadScheduling:
                 return
         self.node2collection[node] = list(collection)
 
-    def mark_test_complete(self, node, item_index, duration=0):
+    def mark_test_complete(self, node, item_index, duration=None):
         """Mark test item as completed by node
-
-        The duration it took to execute the item is used as a hint to
-        the scheduler.
 
         This is called by the ``DSession.worker_testreport`` hook.
         """
         self.node2pending[node].remove(item_index)
-        self.check_schedule(node, duration=duration)
+        self.check_schedule()
 
     def mark_test_pending(self, item):
         self.pending.insert(
             0,
             self.collection.index(item),
         )
-        for node in self.node2pending:
-            self.check_schedule(node)
+        self.check_schedule()
 
-    def check_schedule(self, node, duration=0):
-        """Maybe schedule new items on the node
+    def remove_pending_tests_from_node(self, node, indices):
+        """Node returned some test indices back in response to 'steal' command.
 
-        If there are any globally pending nodes left then this will
-        check if the given node should be given any more tests.  The
-        ``duration`` of the last test is optionally used as a
-        heuristic to influence how many tests the node is assigned.
+        This is called by ``DSession.worker_unscheduled``.
         """
-        if node.shutting_down:
+        assert node is self.steal_requested_from_node
+        self.steal_requested_from_node = None
+
+        indices_set = set(indices)
+        self.node2pending[node] = [
+            i for i in self.node2pending[node] if i not in indices_set
+        ]
+        self.pending.extend(indices)
+        self.check_schedule()
+
+    def check_schedule(self):
+        """Reschedule tests/perform load balancing."""
+        nodes_up = [
+            NodePending(node, pending)
+            for node, pending in self.node2pending.items()
+            if not node.shutting_down
+        ]
+
+        def get_idle_nodes():
+            return [node for node, pending in nodes_up if len(pending) < MIN_PENDING]
+
+        idle_nodes = get_idle_nodes()
+        if not idle_nodes:
             return
 
         if self.pending:
-            # how many nodes do we have?
-            num_nodes = len(self.node2pending)
-            # if our node goes below a heuristic minimum, fill it out to
-            # heuristic maximum
-            items_per_node_min = max(2, len(self.pending) // num_nodes // 4)
-            items_per_node_max = max(2, len(self.pending) // num_nodes // 2)
-            node_pending = self.node2pending[node]
-            if len(node_pending) < items_per_node_min:
-                if duration >= 0.1 and len(node_pending) >= 2:
-                    # seems the node is doing long-running tests
-                    # and has enough items to continue
-                    # so let's rather wait with sending new items
-                    return
-                num_send = items_per_node_max - len(node_pending)
-                # keep at least 2 tests pending even if --maxschedchunk=1
-                maxschedchunk = max(2 - len(node_pending), self.maxschedchunk)
-                self._send_tests(node, min(num_send, maxschedchunk))
-        else:
-            node.shutdown()
+            # Distribute pending tests evenly among idle nodes
+            for i, node in enumerate(idle_nodes):
+                nodes_remaining = len(idle_nodes) - i
+                num_send = len(self.pending) // nodes_remaining
+                self._send_tests(node, num_send)
 
-        self.log("num items waiting for node:", len(self.pending))
+            idle_nodes = get_idle_nodes()
+            # No need to steal anything if all nodes have enough work to continue
+            if not idle_nodes:
+                return
+
+        # Only one active stealing request is allowed
+        if self.steal_requested_from_node is not None:
+            return
+
+        # Find the node that has the longest test queue
+        steal_from = max(
+            nodes_up, key=lambda node_pending: len(node_pending.pending), default=None
+        )
+
+        if steal_from is None:
+            num_steal = 0
+        else:
+            # Steal half of the test queue - but keep that node running too.
+            # If the node has 2 or less tests queued, stealing will fail
+            # anyway.
+            max_steal = max(0, len(steal_from.pending) - MIN_PENDING)
+            num_steal = min(len(steal_from.pending) // 2, max_steal)
+
+        if num_steal == 0:
+            # Can't get more work - shutdown idle nodes. This will force them
+            # to run the last test now instead of waiting for more tests.
+            for node in idle_nodes:
+                node.shutdown()
+            return
+
+        steal_from.node.send_steal(steal_from.pending[-num_steal:])
+        self.steal_requested_from_node = steal_from.node
 
     def remove_node(self, node):
         """Remove a node from the scheduler
@@ -208,14 +246,20 @@ class LoadScheduling:
 
         """
         pending = self.node2pending.pop(node)
-        if not pending:
-            return
 
-        # The node crashed, reassing pending items
-        crashitem = self.collection[pending.pop(0)]
+        # If node was removed without completing its assigned tests - it crashed
+        if pending:
+            crashitem = self.collection[pending.pop(0)]
+        else:
+            crashitem = None
+
         self.pending.extend(pending)
-        for node in self.node2pending:
-            self.check_schedule(node)
+
+        # Dead node won't respond to "steal" request
+        if self.steal_requested_from_node is node:
+            self.steal_requested_from_node = None
+
+        self.check_schedule()
         return crashitem
 
     def schedule(self):
@@ -233,11 +277,9 @@ class LoadScheduling:
 
         # Initial distribution already happened, reschedule on all nodes
         if self.collection is not None:
-            for node in self.nodes:
-                self.check_schedule(node)
+            self.check_schedule()
             return
 
-        # XXX allow nodes to have different collections
         if not self._check_nodes_have_same_collection():
             self.log("**Different tests collected, aborting run**")
             return
@@ -248,39 +290,7 @@ class LoadScheduling:
         if not self.collection:
             return
 
-        if self.maxschedchunk is None:
-            self.maxschedchunk = len(self.collection)
-
-        # Send a batch of tests to run. If we don't have at least two
-        # tests per node, we have to send them all so that we can send
-        # shutdown signals and get all nodes working.
-        if len(self.pending) < 2 * len(self.nodes):
-            # Distribute tests round-robin. Try to load all nodes if there are
-            # enough tests. The other branch tries sends at least 2 tests
-            # to each node - which is suboptimal when you have less than
-            # 2 * len(nodes) tests.
-            nodes = cycle(self.nodes)
-            for i in range(len(self.pending)):
-                self._send_tests(next(nodes), 1)
-        else:
-            # Send batches of consecutive tests. By default, pytest sorts tests
-            # in order for optimal single-threaded execution, minimizing the
-            # number of necessary fixture setup/teardown. Try to keep that
-            # optimal order for every worker.
-
-            # how many items per node do we have about?
-            items_per_node = len(self.collection) // len(self.node2pending)
-            # take a fraction of tests for initial distribution
-            node_chunksize = min(items_per_node // 4, self.maxschedchunk)
-            node_chunksize = max(node_chunksize, 2)
-            # and initialize each node with a chunk of tests
-            for node in self.nodes:
-                self._send_tests(node, node_chunksize)
-
-        if not self.pending:
-            # initial distribution sent all tests, start node shutdown
-            for node in self.nodes:
-                node.shutdown()
+        self.check_schedule()
 
     def _send_tests(self, node, num):
         tests_per_node = self.pending[:num]

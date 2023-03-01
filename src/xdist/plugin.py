@@ -94,7 +94,15 @@ def pytest_addoption(parser):
         "--dist",
         metavar="distmode",
         action="store",
-        choices=["each", "load", "loadscope", "loadfile", "loadgroup", "no"],
+        choices=[
+            "each",
+            "load",
+            "loadscope",
+            "loadfile",
+            "loadgroup",
+            "worksteal",
+            "no",
+        ],
         dest="dist",
         default="no",
         help=(
@@ -107,6 +115,8 @@ def pytest_addoption(parser):
             "loadfile: load balance by sending test grouped by file"
             " to any available environment.\n\n"
             "loadgroup: like load, but sends tests marked with 'xdist_group' to the same worker.\n\n"
+            "worksteal: split the test suite between available environments,"
+            " then rebalance when any worker runs out of tests.\n\n"
             "(default) no: run tests inprocess, don't distribute."
         ),
     )
@@ -151,6 +161,19 @@ def pytest_addoption(parser):
             "the 'testrun_uid' fixture,\n\n,"
             "if not provided, 'testrun_uid' is filled with a new unique string "
             "on every test run."
+        ),
+    )
+    group.addoption(
+        "--maxschedchunk",
+        action="store",
+        type=int,
+        help=(
+            "Maximum number of tests scheduled in one step for --dist=load. "
+            "Setting it to 1 will force pytest to send tests to workers one by "
+            "one - might be useful for a small number of slow tests. "
+            "Larger numbers will allow the scheduler to submit consecutive "
+            "chunks of tests to workers - allows reusing fixtures. "
+            "Unlimited if not set."
         ),
     )
 
